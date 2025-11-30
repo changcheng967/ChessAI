@@ -15,6 +15,8 @@ let transpositionTable = new Map();
 let nodesSearched = 0;
 let pvsCuts = 0;
 let pendingPromotion = null;
+let aiWorker = null;
+let isSearching = false;
 
 // Piece values for AI evaluation
 const PIECE_VALUES = {
@@ -92,6 +94,9 @@ const POSITION_VALUES = {
 
 // Initialize the game
 function initGame() {
+    // Stop any ongoing search
+    stopAISearch();
+    
     board = createInitialBoard();
     currentPlayer = 'white';
     selectedSquare = null;
@@ -113,6 +118,14 @@ function initGame() {
     // If AI starts, make the first move
     if (currentPlayer === aiColor) {
         setTimeout(makeAIMove, 500);
+    }
+}
+
+// Stop AI search
+function stopAISearch() {
+    if (aiWorker && isSearching) {
+        aiWorker.postMessage({ type: 'STOP_SEARCH' });
+        isSearching = false;
     }
 }
 
@@ -517,28 +530,75 @@ function makeMove(move, promotionPiece = null) {
     updateStatus();
 }
 
-// AI Move making with PVS or Alpha-Beta depending on settings
-function makeAIMove() {
-    if (gameOver) return;
-    
-    const bestMove = findBestMove();
-    if (bestMove) {
-        makeMove(bestMove);
-        
-        // Check for game end
-        if (isCheckmate(switchColor(currentPlayer))) {
-            updateStatus('Checkmate! ' + currentPlayer.charAt(0).toUpperCase() + currentPlayer.slice(1) + ' wins!');
-            gameOver = true;
-            return;
-        } else if (isStalemate(switchColor(currentPlayer))) {
-            updateStatus('Stalemate! The game is a draw.');
-            gameOver = true;
-            return;
-        }
-        
-        currentPlayer = switchColor(currentPlayer);
-        updateTurnIndicator();
+// Initialize AI worker
+function initAIWorker() {
+    if (!aiWorker) {
+        aiWorker = new Worker('ai-worker.js');
+        aiWorker.onmessage = function(e) {
+            const { type, data } = e.data;
+            
+            if (type === 'SEARCH_COMPLETE') {
+                isSearching = false;
+                
+                if (data.bestMove) {
+                    makeMove(data.bestMove);
+                    
+                    // Check for game end
+                    if (isCheckmate(switchColor(currentPlayer))) {
+                        updateStatus('Checkmate! ' + currentPlayer.charAt(0).toUpperCase() + currentPlayer.slice(1) + ' wins!');
+                        gameOver = true;
+                        return;
+                    } else if (isStalemate(switchColor(currentPlayer))) {
+                        updateStatus('Stalemate! The game is a draw.');
+                        gameOver = true;
+                        return;
+                    }
+                    
+                    currentPlayer = switchColor(currentPlayer);
+                    updateTurnIndicator();
+                } else {
+                    updateStatus('AI could not find a move.');
+                }
+                
+                // Update status with performance info
+                const performanceInfo = `Nodes: ${data.nodesSearched.toLocaleString()}, PVS cuts: ${data.pvsCuts.toLocaleString()}, Time: ${data.elapsedTime.toFixed(2)}ms`;
+                updateStatus(`PVS Depth ${customDepth} - ${performanceInfo}`);
+            } else if (type === 'SEARCH_PROGRESS') {
+                // Update progress during search
+                const { depth, maxDepth, nodesSearched, pvsCuts } = data;
+                updateStatus(`Searching... Depth ${depth}/${maxDepth}, Nodes: ${nodesSearched.toLocaleString()}, Cuts: ${pvsCuts.toLocaleString()}`);
+            }
+        };
     }
+}
+
+// AI Move making with web worker
+function makeAIMove() {
+    if (gameOver || isSearching) return;
+    
+    isSearching = true;
+    
+    // Initialize worker if not already done
+    initAIWorker();
+    
+    // Send search request to worker
+    aiWorker.postMessage({
+        type: 'INIT',
+        data: {
+            board: board,
+            aiColor: aiColor,
+            playerColor: playerColor,
+            customDepth: customDepth,
+            usePVS: usePVS
+        }
+    });
+    
+    aiWorker.postMessage({
+        type: 'FIND_BEST_MOVE',
+        data: {}
+    });
+    
+    updateStatus(`AI thinking... Depth ${customDepth}, PVS: ${usePVS ? 'ON' : 'OFF'}`);
 }
 
 // Find best move using PVS or Alpha-Beta depending on settings with advanced optimizations
@@ -1929,11 +1989,13 @@ function handleDrop(e) {
 document.getElementById('newGameBtn').addEventListener('click', initGame);
 document.getElementById('undoBtn').addEventListener('click', () => {
     if (gameHistory.length > 0) {
+        stopAISearch();
         undoLastMove();
         renderBoard();
         updateStatus();
     }
 });
+document.getElementById('stopSearchBtn').addEventListener('click', stopAISearch);
 document.getElementById('difficulty').addEventListener('change', (e) => {
     difficulty = parseInt(e.target.value);
 });
