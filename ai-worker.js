@@ -946,6 +946,7 @@ function evaluateBoard(boardState, color) {
         }
     }
     
+    
     if (isKingInCheckForBoard(boardState, color)) {
         score -= 100;
     }
