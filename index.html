@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chess AI - Pure Algorithm</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Chess AI</h1>
+            <div class="game-info">
+                <div class="status" id="status">Choose your color to start</div>
+                <div class="controls">
+                    <button id="newGameBtn">New Game</button>
+                    <button id="undoBtn">Undo Move</button>
+                    <label for="difficulty">Difficulty:</label>
+                    <select id="difficulty">
+                        <option value="1">Easy (Depth 1)</option>
+                        <option value="2" selected>Medium (Depth 2)</option>
+                        <option value="3">Hard (Depth 3)</option>
+                        <option value="4">Expert (Depth 4)</option>
+                    </select>
+                    <label for="customDepth">Custom Depth:</label>
+                    <input type="number" id="customDepth" min="1" max="10" value="4">
+                    <label for="usePVS">Use PVS:</label>
+                    <input type="checkbox" id="usePVS" checked>
+                    <button id="applySettingsBtn">Apply Settings</button>
+                </div>
+            </div>
+        </header>
+
+        <main class="game-container">
+            <div class="side-panel">
+                <div class="player-info">
+                    <div class="player white-player">
+                        <div class="player-name">White</div>
+                        <div class="player-type" id="whiteType">Human</div>
+                    </div>
+                    <div class="turn-indicator" id="turnIndicator">White's Turn</div>
+                    <div class="player black-player">
+                        <div class="player-name">Black</div>
+                        <div class="player-type" id="blackType">AI</div>
+                    </div>
+                </div>
+                
+                <div class="move-history">
+                    <h3>Move History</h3>
+                    <div id="moveList" class="move-list"></div>
+                </div>
+            </div>
+
+            <div class="board-container">
+                <div id="board" class="chess-board"></div>
+            </div>
+        </main>
+    </div>
+
+    <script src="chess.js"></script>
+    
+    <!-- Pawn Promotion Dialog -->
+    <div id="promotionModal" class="modal">
+        <div class="modal-content">
+            <h3>Promote Pawn</h3>
+            <div id="promotionOptions" class="promotion-options"></div>
+        </div>
+    </div>
+</body>
+</html>
