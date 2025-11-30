@@ -482,16 +482,21 @@ function makeMove(move, promotionPiece = null) {
         inCheck: inCheck
     });
     
-    // Make the move
-    board[to.row][to.col] = piece;
-    board[from.row][from.col] = null;
-    
     // Check for pawn promotion
-    if (piece.type === 'pawn' && (to.row === 0 || to.row === 7)) {
-        if (promotionPiece) {
-            // Promotion piece provided (AI or modal selection)
-            board[to.row][to.col] = { type: promotionPiece, color: piece.color };
-        } else if (currentPlayer === playerColor) {
+    if (move.promotion) {
+        // Promotion move - use the specified promotion piece or default to queen for AI
+        const promoPiece = promotionPiece || move.promotion || 'queen';
+        board[to.row][to.col] = { type: promoPiece, color: piece.color };
+        board[from.row][from.col] = null;
+    } else {
+        // Regular move
+        board[to.row][to.col] = piece;
+        board[from.row][from.col] = null;
+    }
+    
+    // Handle player promotion selection
+    if (piece.type === 'pawn' && (to.row === 0 || to.row === 7) && !move.promotion) {
+        if (currentPlayer === playerColor) {
             // Player needs to choose promotion
             pendingPromotion = { move, color: piece.color };
             showPromotionModal(piece.color);
@@ -536,7 +541,7 @@ function makeAIMove() {
     }
 }
 
-// Find best move using PVS or Alpha-Beta depending on settings
+// Find best move using PVS or Alpha-Beta depending on settings with advanced optimizations
 function findBestMove() {
     const currentDepth = usePVS ? customDepth : difficulty;
     const moves = getAllValidMoves(aiColor);
@@ -546,10 +551,209 @@ function findBestMove() {
     const orderedMoves = orderMoves(moves, board, aiColor);
     
     if (usePVS) {
-        return findBestMovePVS(orderedMoves, currentDepth);
+        // Use iterative deepening for better move ordering
+        return findBestMoveWithIterativeDeepening(orderedMoves, currentDepth);
     } else {
         return findBestMoveAlphaBeta(orderedMoves, currentDepth);
     }
+}
+
+// Find best move with iterative deepening and aspiration windows
+function findBestMoveWithIterativeDeepening(moves, maxDepth) {
+    let bestMove = moves[0];
+    let bestValue = -Infinity;
+    let alpha = -Infinity;
+    let beta = Infinity;
+    nodesSearched = 0;
+    pvsCuts = 0;
+    
+    // Iterative deepening
+    for (let depth = 1; depth <= maxDepth; depth++) {
+        const hash = generateZobristHash(board);
+        
+        // Aspiration windows for deeper searches
+        let searchAlpha, searchBeta;
+        if (depth <= 2) {
+            searchAlpha = -Infinity;
+            searchBeta = Infinity;
+        } else {
+            // Narrow window around previous best value
+            searchAlpha = bestValue - 25;
+            searchBeta = bestValue + 25;
+        }
+        
+        let value;
+        try {
+            value = pvsSearchWithAspiration(board, depth, false, searchAlpha, searchBeta, aiColor);
+        } catch (e) {
+            // If aspiration window failed, do full search
+            value = pvsSearch(board, depth, false, alpha, beta, aiColor);
+        }
+        
+        if (value > bestValue) {
+            bestValue = value;
+            // Find the actual best move at this depth
+            bestMove = findBestMoveAtDepth(board, depth, aiColor);
+        }
+        
+        // Update aspiration window bounds
+        alpha = Math.max(alpha, bestValue);
+        
+        // Update status with current depth progress
+        const performanceInfo = `Depth ${depth}/${maxDepth}, Nodes: ${nodesSearched.toLocaleString()}, PVS cuts: ${pvsCuts.toLocaleString()}`;
+        updateStatus(`PVS ${performanceInfo}`);
+    }
+    
+    // Store final result in transposition table
+    const finalHash = generateZobristHash(board);
+    storeInTT(finalHash, maxDepth, bestValue, 0, bestMove);
+    
+    return bestMove;
+}
+
+// PVS search with aspiration windows
+function pvsSearchWithAspiration(boardState, depth, isMaximizing, alpha, beta, color) {
+    nodesSearched++;
+    
+    // Check transposition table
+    const hash = generateZobristHash(boardState);
+    const ttEntry = retrieveFromTT(hash, depth);
+    
+    if (ttEntry && ttEntry.flag === 0) { // Exact value
+        return ttEntry.value;
+    }
+    
+    if (depth === 0 || isGameOverState(boardState, color)) {
+        const evalValue = evaluateBoard(boardState, aiColor);
+        storeInTT(hash, depth, evalValue, 0, null);
+        return evalValue;
+    }
+    
+    const currentColor = isMaximizing ? aiColor : playerColor;
+    const moves = getAllValidMovesForColor(boardState, currentColor);
+    const orderedMoves = orderMoves(moves, boardState, currentColor);
+    
+    if (isMaximizing) {
+        let maxEval = -Infinity;
+        
+        for (let i = 0; i < orderedMoves.length; i++) {
+            const move = orderedMoves[i];
+            const tempBoard = copyBoard(boardState);
+            
+            // Handle promotion moves in AI search
+            if (move.promotion) {
+                tempBoard[move.to.row][move.to.col] = { type: move.promotion, color: tempBoard[move.from.row][move.from.col].color };
+            } else {
+                tempBoard[move.to.row][move.to.col] = tempBoard[move.from.row][move.from.col];
+            }
+            tempBoard[move.from.row][move.from.col] = null;
+            
+            let evaluation;
+            
+            if (i === 0) {
+                // First move: full search
+                evaluation = pvsSearch(tempBoard, depth - 1, false, alpha, beta, switchColor(color));
+            } else {
+                // Subsequent moves: null-window search with aspiration
+                evaluation = pvsSearch(tempBoard, depth - 1, false, alpha, alpha + 1, switchColor(color));
+                
+                // If null-window search suggests this move is better, do full search
+                if (evaluation > alpha) {
+                    evaluation = pvsSearch(tempBoard, depth - 1, false, alpha, beta, switchColor(color));
+                }
+            }
+            
+            maxEval = Math.max(maxEval, evaluation);
+            alpha = Math.max(alpha, maxEval);
+            
+            if (beta <= alpha) {
+                // Store in TT as lower bound
+                storeInTT(hash, depth, alpha, 1, move);
+                break;
+            }
+        }
+        
+        storeInTT(hash, depth, maxEval, 0, null);
+        return maxEval;
+    } else {
+        let minEval = Infinity;
+        
+        for (let i = 0; i < orderedMoves.length; i++) {
+            const move = orderedMoves[i];
+            const tempBoard = copyBoard(boardState);
+            
+            // Handle promotion moves in AI search
+            if (move.promotion) {
+                tempBoard[move.to.row][move.to.col] = { type: move.promotion, color: tempBoard[move.from.row][move.from.col].color };
+            } else {
+                tempBoard[move.to.row][move.to.col] = tempBoard[move.from.row][move.from.col];
+            }
+            tempBoard[move.from.row][move.from.col] = null;
+            
+            let evaluation;
+            
+            if (i === 0) {
+                // First move: full search
+                evaluation = pvsSearch(tempBoard, depth - 1, true, alpha, beta, switchColor(color));
+            } else {
+                // Subsequent moves: null-window search with aspiration
+                evaluation = pvsSearch(tempBoard, depth - 1, true, beta - 1, beta, switchColor(color));
+                
+                // If null-window search suggests this move is better, do full search
+                if (evaluation < beta) {
+                    evaluation = pvsSearch(tempBoard, depth - 1, true, alpha, beta, switchColor(color));
+                }
+            }
+            
+            minEval = Math.min(minEval, evaluation);
+            beta = Math.min(beta, minEval);
+            
+            if (beta <= alpha) {
+                // Store in TT as upper bound
+                storeInTT(hash, depth, beta, 2, move);
+                break;
+            }
+        }
+        
+        storeInTT(hash, depth, minEval, 0, null);
+        return minEval;
+    }
+}
+
+// Find best move at specific depth (for iterative deepening)
+function findBestMoveAtDepth(boardState, depth, color) {
+    const moves = getAllValidMoves(color);
+    if (moves.length === 0) return null;
+    
+    let bestMove = moves[0];
+    let bestValue = -Infinity;
+    let alpha = -Infinity;
+    let beta = Infinity;
+    
+    const orderedMoves = orderMoves(moves, boardState, color);
+    
+    for (const move of orderedMoves) {
+        const tempBoard = copyBoard(boardState);
+        
+        // Handle promotion moves
+        if (move.promotion) {
+            tempBoard[move.to.row][move.to.col] = { type: move.promotion, color: tempBoard[move.from.row][move.from.col].color };
+        } else {
+            tempBoard[move.to.row][move.to.col] = tempBoard[move.from.row][move.from.col];
+        }
+        tempBoard[move.from.row][move.from.col] = null;
+        
+        const value = pvsSearch(tempBoard, depth - 1, false, alpha, beta, switchColor(color));
+        
+        if (value > bestValue) {
+            bestValue = value;
+            bestMove = move;
+        }
+        
+        alpha = Math.max(alpha, bestValue);
+    }
+    
+    return bestMove;
 }
 
 // Find best move using Principal Variation Search (PVS)
@@ -667,7 +871,13 @@ function pvsSearch(boardState, depth, isMaximizing, alpha, beta, color) {
         for (let i = 0; i < orderedMoves.length; i++) {
             const move = orderedMoves[i];
             const tempBoard = copyBoard(boardState);
-            tempBoard[move.to.row][move.to.col] = tempBoard[move.from.row][move.from.col];
+            
+            // Handle promotion moves in AI search
+            if (move.promotion) {
+                tempBoard[move.to.row][move.to.col] = { type: move.promotion, color: tempBoard[move.from.row][move.from.col].color };
+            } else {
+                tempBoard[move.to.row][move.to.col] = tempBoard[move.from.row][move.from.col];
+            }
             tempBoard[move.from.row][move.from.col] = null;
             
             let evaluation;
@@ -703,7 +913,13 @@ function pvsSearch(boardState, depth, isMaximizing, alpha, beta, color) {
         for (let i = 0; i < orderedMoves.length; i++) {
             const move = orderedMoves[i];
             const tempBoard = copyBoard(boardState);
-            tempBoard[move.to.row][move.to.col] = tempBoard[move.from.row][move.from.col];
+            
+            // Handle promotion moves in AI search
+            if (move.promotion) {
+                tempBoard[move.to.row][move.to.col] = { type: move.promotion, color: tempBoard[move.from.row][move.from.col].color };
+            } else {
+                tempBoard[move.to.row][move.to.col] = tempBoard[move.from.row][move.from.col];
+            }
             tempBoard[move.from.row][move.from.col] = null;
             
             let evaluation;
@@ -799,10 +1015,11 @@ function isGameOverState(boardState, color) {
     return isCheckmateForBoard(boardState, color) || isStalemateForBoard(boardState, color);
 }
 
-// Evaluate board position
+// Evaluate board position with advanced features for maximum strength
 function evaluateBoard(boardState, color) {
     let score = 0;
     
+    // Material and positional evaluation
     for (let row = 0; row < 8; row++) {
         for (let col = 0; col < 8; col++) {
             const piece = boardState[row][col];
@@ -819,7 +1036,7 @@ function evaluateBoard(boardState, color) {
         }
     }
     
-    // Bonus for controlling the center
+    // Advanced center control evaluation
     const centerBonus = [
         [1, 2, 2, 1],
         [2, 4, 4, 2],
@@ -834,24 +1051,372 @@ function evaluateBoard(boardState, color) {
             const piece = boardState[row][col];
             if (piece) {
                 if (piece.color === color) {
-                    score += centerBonus[i][j] * 10;
+                    score += centerBonus[i][j] * 15; // Increased bonus for center control
                 } else {
-                    score -= centerBonus[i][j] * 10;
+                    score -= centerBonus[i][j] * 15;
                 }
             }
         }
     }
     
+    // Pawn structure evaluation
+    score += evaluatePawnStructure(boardState, color) - evaluatePawnStructure(boardState, switchColor(color));
+    
+    // Piece activity evaluation
+    score += evaluatePieceActivity(boardState, color) - evaluatePieceActivity(boardState, switchColor(color));
+    
+    // King safety evaluation
+    score += evaluateKingSafety(boardState, color) - evaluateKingSafety(boardState, switchColor(color));
+    
+    // Mobility evaluation
+    score += evaluateMobility(boardState, color) - evaluateMobility(boardState, switchColor(color));
+    
     // Penalty for being in check
     if (isKingInCheckForBoard(boardState, color)) {
-        score -= 50;
+        score -= 100; // Increased penalty for being in check
     }
     
     if (isKingInCheckForBoard(boardState, switchColor(color))) {
-        score += 50;
+        score += 100; // Increased bonus for checking opponent
+    }
+    
+    // Endgame evaluation - increase king activity in endgame
+    const totalMaterial = calculateTotalMaterial(boardState);
+    if (totalMaterial < 1500) { // Endgame threshold
+        score += evaluateEndgameKingActivity(boardState, color) - evaluateEndgameKingActivity(boardState, switchColor(color));
     }
     
     return score;
+}
+
+// Evaluate pawn structure
+function evaluatePawnStructure(boardState, color) {
+    let score = 0;
+    
+    for (let row = 0; row < 8; row++) {
+        for (let col = 0; col < 8; col++) {
+            const piece = boardState[row][col];
+            if (piece && piece.type === 'pawn' && piece.color === color) {
+                // Penalize isolated pawns
+                if (isIsolatedPawn(boardState, row, col, color)) {
+                    score -= 10;
+                }
+                
+                // Penalize doubled pawns
+                if (isDoubledPawn(boardState, row, col, color)) {
+                    score -= 5;
+                }
+                
+                // Penalize backward pawns
+                if (isBackwardPawn(boardState, row, col, color)) {
+                    score -= 8;
+                }
+                
+                // Bonus for passed pawns
+                if (isPassedPawn(boardState, row, col, color)) {
+                    score += 15 + (color === 'white' ? row * 5 : (7 - row) * 5);
+                }
+            }
+        }
+    }
+    
+    return score;
+}
+
+// Check if pawn is isolated
+function isIsolatedPawn(boardState, row, col, color) {
+    const leftCol = col - 1;
+    const rightCol = col + 1;
+    const direction = color === 'white' ? -1 : 1;
+    
+    // Check if there are friendly pawns in adjacent files
+    for (let r = 0; r < 8; r++) {
+        if (leftCol >= 0 && boardState[r][leftCol] && boardState[r][leftCol].type === 'pawn' && boardState[r][leftCol].color === color) {
+            return false;
+        }
+        if (rightCol < 8 && boardState[r][rightCol] && boardState[r][rightCol].type === 'pawn' && boardState[r][rightCol].color === color) {
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+// Check if pawn is doubled
+function isDoubledPawn(boardState, row, col, color) {
+    const direction = color === 'white' ? -1 : 1;
+    
+    // Check if there's another pawn of same color in same file
+    for (let r = 0; r < 8; r++) {
+        if (r !== row && boardState[r][col] && boardState[r][col].type === 'pawn' && boardState[r][col].color === color) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// Check if pawn is backward
+function isBackwardPawn(boardState, row, col, color) {
+    const direction = color === 'white' ? -1 : 1;
+    const attackRow = row + direction;
+    
+    // Check if pawn can be attacked by enemy pawns but can't advance safely
+    if (attackRow >= 0 && attackRow < 8) {
+        const leftCol = col - 1;
+        const rightCol = col + 1;
+        
+        const leftAttack = leftCol >= 0 && boardState[attackRow][leftCol] &&
+                          boardState[attackRow][leftCol].type === 'pawn' &&
+                          boardState[attackRow][leftCol].color !== color;
+        
+        const rightAttack = rightCol < 8 && boardState[attackRow][rightCol] &&
+                           boardState[attackRow][rightCol].type === 'pawn' &&
+                           boardState[attackRow][rightCol].color !== color;
+        
+        if ((leftAttack || rightAttack) && !canAdvanceSafely(boardState, row, col, color)) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+// Check if pawn can advance safely
+function canAdvanceSafely(boardState, row, col, color) {
+    const direction = color === 'white' ? -1 : 1;
+    const nextRow = row + direction;
+    
+    if (nextRow >= 0 && nextRow < 8 && !boardState[nextRow][col]) {
+        // Check if the square is not attacked by enemy pieces
+        return !isSquareAttacked(boardState, nextRow, col, switchColor(color));
+    }
+    
+    return false;
+}
+
+// Check if pawn is passed
+function isPassedPawn(boardState, row, col, color) {
+    const direction = color === 'white' ? 1 : -1; // Look ahead in opponent's direction
+    const startRow = color === 'white' ? row + 1 : row - 1;
+    const endRow = color === 'white' ? 8 : -1;
+    
+    for (let r = startRow; r !== endRow; r += direction) {
+        if (boardState[r][col] && boardState[r][col].type === 'pawn' && boardState[r][col].color !== color) {
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+// Evaluate piece activity
+function evaluatePieceActivity(boardState, color) {
+    let score = 0;
+    
+    for (let row = 0; row < 8; row++) {
+        for (let col = 0; col < 8; col++) {
+            const piece = boardState[row][col];
+            if (piece && piece.color === color && piece.type !== 'king') {
+                const mobility = countLegalMoves(boardState, row, col, color);
+                score += mobility * 2; // Bonus for piece mobility
+            }
+        }
+    }
+    
+    return score;
+}
+
+// Count legal moves for a piece
+function countLegalMoves(boardState, row, col, color) {
+    let count = 0;
+    const piece = boardState[row][col];
+    
+    if (!piece) return 0;
+    
+    switch (piece.type) {
+        case 'pawn':
+            // Simple mobility count for pawns
+            const direction = color === 'white' ? -1 : 1;
+            const nextRow = row + direction;
+            if (nextRow >= 0 && nextRow < 8 && !boardState[nextRow][col]) {
+                count++;
+                // Double move from starting position
+                const startRow = color === 'white' ? 6 : 1;
+                if (row === startRow && !boardState[nextRow + direction][col]) {
+                    count++;
+                }
+            }
+            // Captures
+            const leftCol = col - 1;
+            const rightCol = col + 1;
+            if (leftCol >= 0 && nextRow >= 0 && nextRow < 8 &&
+                boardState[nextRow][leftCol] && boardState[nextRow][leftCol].color !== color) {
+                count++;
+            }
+            if (rightCol < 8 && nextRow >= 0 && nextRow < 8 &&
+                boardState[nextRow][rightCol] && boardState[nextRow][rightCol].color !== color) {
+                count++;
+            }
+            break;
+            
+        case 'knight':
+        case 'bishop':
+        case 'rook':
+        case 'queen':
+            // Use existing move generation functions
+            const moves = getMovesForPiece(boardState, row, col, piece);
+            count = moves.length;
+            break;
+    }
+    
+    return count;
+}
+
+// Get moves for a specific piece on a board
+function getMovesForPiece(boardState, row, col, piece) {
+    switch (piece.type) {
+        case 'knight':
+            return getKnightMovesForBoard(boardState, row, col, piece.color);
+        case 'bishop':
+            return getBishopMovesForBoard(boardState, row, col, piece.color);
+        case 'rook':
+            return getRookMovesForBoard(boardState, row, col, piece.color);
+        case 'queen':
+            return getQueenMovesForBoard(boardState, row, col, piece.color);
+        default:
+            return [];
+    }
+}
+
+// Evaluate king safety
+function evaluateKingSafety(boardState, color) {
+    let score = 0;
+    const kingPos = findKingForBoard(boardState, color);
+    
+    if (!kingPos) return score;
+    
+    // Penalize exposed king
+    const openFilesNearKing = countOpenFilesNearKing(boardState, kingPos, color);
+    score -= openFilesNearKing * 15;
+    
+    // Bonus for castling
+    if (hasCastled(boardState, color)) {
+        score += 20;
+    }
+    
+    // Penalize king in center in opening/middlegame
+    if (kingPos.row >= 2 && kingPos.row <= 5 && kingPos.col >= 2 && kingPos.col <= 5) {
+        score -= 10;
+    }
+    
+    return score;
+}
+
+// Count open files near king
+function countOpenFilesNearKing(boardState, kingPos, color) {
+    let count = 0;
+    const kingCol = kingPos.col;
+    
+    // Check files around king
+    for (let colOffset = -2; colOffset <= 2; colOffset++) {
+        const checkCol = kingCol + colOffset;
+        if (checkCol >= 0 && checkCol < 8) {
+            // Check if file is open (no pawns of same color)
+            let hasFriendlyPawn = false;
+            for (let row = 0; row < 8; row++) {
+                const piece = boardState[row][checkCol];
+                if (piece && piece.type === 'pawn' && piece.color === color) {
+                    hasFriendlyPawn = true;
+                    break;
+                }
+            }
+            if (!hasFriendlyPawn) {
+                count++;
+            }
+        }
+    }
+    
+    return count;
+}
+
+// Check if side has castled
+function hasCastled(boardState, color) {
+    const backRank = color === 'white' ? 7 : 0;
+    const kingCol = color === 'white' ? 6 : 6; // Check for kingside castling
+    const queenCol = color === 'white' ? 2 : 2; // Check for queenside castling
+    
+    const king = boardState[backRank][kingCol];
+    const rookKingside = boardState[backRank][5]; // Rook moved to kingside
+    const rookQueenside = boardState[backRank][3]; // Rook moved to queenside
+    
+    return (king && king.type === 'king' && king.color === color) ||
+           (rookKingside && rookKingside.type === 'rook' && rookKingside.color === color) ||
+           (rookQueenside && rookQueenside.type === 'rook' && rookQueenside.color === color);
+}
+
+// Evaluate mobility
+function evaluateMobility(boardState, color) {
+    let score = 0;
+    
+    for (let row = 0; row < 8; row++) {
+        for (let col = 0; col < 8; col++) {
+            const piece = boardState[row][col];
+            if (piece && piece.color === color) {
+                const moves = getMovesForPiece(boardState, row, col, piece);
+                score += moves.length;
+            }
+        }
+    }
+    
+    return score;
+}
+
+// Evaluate endgame king activity
+function evaluateEndgameKingActivity(boardState, color) {
+    let score = 0;
+    const kingPos = findKingForBoard(boardState, color);
+    
+    if (kingPos) {
+        // In endgame, king should be active and central
+        const centerDistance = Math.abs(kingPos.row - 3.5) + Math.abs(kingPos.col - 3.5);
+        score += (7 - centerDistance) * 5; // Bonus for central king
+    }
+    
+    return score;
+}
+
+// Calculate total material on board
+function calculateTotalMaterial(boardState) {
+    let total = 0;
+    
+    for (let row = 0; row < 8; row++) {
+        for (let col = 0; col < 8; col++) {
+            const piece = boardState[row][col];
+            if (piece) {
+                total += PIECE_VALUES[piece.type];
+            }
+        }
+    }
+    
+    return total;
+}
+
+// Check if square is attacked by enemy pieces
+function isSquareAttacked(boardState, row, col, attackerColor) {
+    for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+            const piece = boardState[r][c];
+            if (piece && piece.color === attackerColor) {
+                const moves = getAttackMovesForBoard(boardState, r, c, piece);
+                if (moves.some(move => move.to.row === row && move.to.col === col)) {
+                    return true;
+                }
+            }
+        }
+    }
+    
+    return false;
 }
 
 // Check if king is in check
@@ -1156,12 +1721,26 @@ function getPawnMovesForBoard(boardState, row, col, color) {
     const moves = [];
     const direction = color === 'white' ? -1 : 1;
     const startRow = color === 'white' ? 6 : 1;
+    const promotionRow = color === 'white' ? 0 : 7;
     
     if (isInBounds(row + direction, col) && !boardState[row + direction][col]) {
-        moves.push({ from: { row, col }, to: { row: row + direction, col } });
-        
-        if (row === startRow && !boardState[row + 2 * direction][col]) {
-            moves.push({ from: { row, col }, to: { row: row + 2 * direction, col } });
+        const newRow = row + direction;
+        if (newRow === promotionRow) {
+            // Promotion move - generate all promotion options
+            const promotionPieces = ['queen', 'rook', 'bishop', 'knight'];
+            promotionPieces.forEach(pieceType => {
+                moves.push({
+                    from: { row, col },
+                    to: { row: newRow, col },
+                    promotion: pieceType
+                });
+            });
+        } else {
+            moves.push({ from: { row, col }, to: { row: newRow, col } });
+            
+            if (row === startRow && !boardState[row + 2 * direction][col]) {
+                moves.push({ from: { row, col }, to: { row: row + 2 * direction, col } });
+            }
         }
     }
     
@@ -1171,7 +1750,19 @@ function getPawnMovesForBoard(boardState, row, col, color) {
         const newCol = col + offset.col;
         
         if (isInBounds(newRow, newCol) && boardState[newRow][newCol] && boardState[newRow][newCol].color !== color) {
-            moves.push({ from: { row, col }, to: { row: newRow, col: newCol } });
+            if (newRow === promotionRow) {
+                // Promotion capture - generate all promotion options
+                const promotionPieces = ['queen', 'rook', 'bishop', 'knight'];
+                promotionPieces.forEach(pieceType => {
+                    moves.push({
+                        from: { row, col },
+                        to: { row: newRow, col: newCol },
+                        promotion: pieceType
+                    });
+                });
+            } else {
+                moves.push({ from: { row, col }, to: { row: newRow, col: newCol } });
+            }
         }
     });
     
@@ -1480,9 +2071,11 @@ function retrieveFromTT(hash, depth) {
 // Move ordering for better PVS performance
 function orderMoves(moves, boardState, color) {
     const orderedMoves = [];
+    const queenPromotions = [];
     const captures = [];
     const checks = [];
     const kills = [];
+    const otherPromotions = [];
     const others = [];
     
     for (const move of moves) {
@@ -1490,20 +2083,25 @@ function orderMoves(moves, boardState, color) {
         const isCapture = targetPiece !== null;
         const isCheck = wouldGiveCheck(boardState, move, color);
         const isKill = isKillerMove(move);
+        const isQueenPromotion = move.promotion === 'queen';
         
-        if (isKill) {
+        if (isQueenPromotion) {
+            queenPromotions.push(move);
+        } else if (isKill) {
             kills.push(move);
         } else if (isCheck) {
             checks.push(move);
         } else if (isCapture) {
             captures.push(move);
+        } else if (move.promotion) {
+            otherPromotions.push(move);
         } else {
             others.push(move);
         }
     }
     
-    // Order: killers, captures, checks, others
-    return [...kills, ...captures, ...checks, ...others];
+    // Order: queen promotions, killers, captures, checks, other promotions, others
+    return [...queenPromotions, ...kills, ...captures, ...checks, ...otherPromotions, ...others];
 }
 
 // Check if move would give check
